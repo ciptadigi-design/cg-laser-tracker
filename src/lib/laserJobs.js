@@ -4,7 +4,7 @@ const TABLE = 'laser_jobs';
 
 // Supabase/PostgREST caps a single response at 1000 rows by default. A plain
 // SELECT would silently truncate history once the table passes that size, so
-// fetchAllJobs pages through .range() until a page comes back short.
+// fetchJobsForPeriod pages through .range() until a page comes back short.
 const PAGE_SIZE = 1000;
 
 // A single INSERT statement (one .insert() call with an array of rows) is one
@@ -80,23 +80,40 @@ export function toMigrationRowPayload(validatedRow) {
   };
 }
 
-/** Fetches every row in laser_jobs, paging past the PostgREST row cap. Sorted by tanggal desc, matching prior app behavior. */
-export async function fetchAllJobs() {
+
+/**
+ * Fetches laser_jobs for a resolved period descriptor (see
+ * lib/period.js#resolvePeriodRange), filtering server-side on `tanggal` (the
+ * business date, never created_at) so the query scales past the PostgREST
+ * 1000-row page cap and never downloads rows outside the selected period.
+ * range.start/range.end are inclusive 'YYYY-MM-DD' strings compared
+ * directly against the `date` column — no timezone conversion involved.
+ */
+export async function fetchJobsForPeriod(range) {
   const rows = [];
   let from = 0;
   for (;;) {
     const to = from + PAGE_SIZE - 1;
-    const { data, error } = await supabase
-      .from(TABLE)
-      .select('*')
-      .order('tanggal', { ascending: false })
-      .range(from, to);
+    let query = supabase.from(TABLE).select('*').order('tanggal', { ascending: false });
+    if (range.mode === 'range') {
+      query = query.gte('tanggal', range.start).lte('tanggal', range.end);
+    }
+    const { data, error } = await query.range(from, to);
     if (error) throw error;
     rows.push(...data);
     if (data.length < PAGE_SIZE) break;
     from += PAGE_SIZE;
   }
   return rows;
+}
+
+/** Total row count across all of laser_jobs, independent of any period filter — used to gate the one-time legacy import UI (only shown while the table is empty). */
+export async function countAllJobs() {
+  const { count, error } = await supabase
+    .from(TABLE)
+    .select('*', { count: 'exact', head: true });
+  if (error) throw error;
+  return count;
 }
 
 export async function insertJob(formData) {
