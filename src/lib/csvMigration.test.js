@@ -2,7 +2,8 @@ import { describe, it, expect } from 'vitest';
 import { exportJobsToCsv, parseImportCsv, validateRow, CANONICAL_HEADERS } from './csvMigration';
 
 const baseJob = {
-  id: 'firebase-doc-abc123',
+  id: '11111111-1111-4111-8111-111111111111',
+  legacy_firebase_id: 'firebase-doc-abc123',
   tanggal: '2026-01-15',
   operator: 'Budi',
   invoice_code: 'INV/CG/001',
@@ -27,7 +28,7 @@ describe('CSV export/import round trip', () => {
     expect(result.ok).toBe(true);
     expect(result.rows).toHaveLength(1);
     const row = result.rows[0];
-    expect(row.legacy_firebase_id).toBe(baseJob.id);
+    expect(row.legacy_firebase_id).toBe(baseJob.legacy_firebase_id);
     expect(row.tanggal).toBe(baseJob.tanggal);
     expect(row.operator).toBe(baseJob.operator);
     expect(row.invoice_code).toBe(baseJob.invoice_code);
@@ -95,11 +96,19 @@ describe('CSV export/import round trip', () => {
     expect(result.rows[0].total_penghasilan).toBe(6250000000);
   });
 
+  it('exports a normal Supabase-native record (legacy_firebase_id null) with a blank column, not the row id', () => {
+    const nativeJob = { ...baseJob, id: '22222222-2222-4222-8222-222222222222', legacy_firebase_id: null };
+    const csv = exportJobsToCsv([nativeJob]);
+    const dataLine = csv.split(/\r?\n/)[1];
+    expect(dataLine.startsWith(',')).toBe(true); // legacy_firebase_id is the first column and is blank
+    expect(dataLine).not.toContain(nativeJob.id);
+  });
+
   it('round-trips multiple mixed edge-case rows together', () => {
     const jobs = [
       baseJob,
-      { ...baseJob, id: 'doc-2', customer: 'PT Maju, Jaya', invoice_code: '' },
-      { ...baseJob, id: 'doc-3', deskripsi: 'Logo "Premium"\nedisi 2' },
+      { ...baseJob, legacy_firebase_id: 'doc-2', customer: 'PT Maju, Jaya', invoice_code: '' },
+      { ...baseJob, legacy_firebase_id: 'doc-3', deskripsi: 'Logo "Premium"\nedisi 2' },
     ];
     const { result } = roundTrip(jobs);
     expect(result.ok).toBe(true);
@@ -185,7 +194,7 @@ describe('parseImportCsv pre-flight gating', () => {
 
   it('rejects import when legacy_firebase_id was already imported previously', () => {
     const csv = exportJobsToCsv([baseJob]);
-    const existingJobs = [{ legacy_firebase_id: baseJob.id }];
+    const existingJobs = [{ legacy_firebase_id: baseJob.legacy_firebase_id }];
     const result = parseImportCsv(csv, existingJobs);
     expect(result.ok).toBe(false);
     expect(result.stage).toBe('duplicates');

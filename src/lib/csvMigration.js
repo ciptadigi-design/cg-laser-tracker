@@ -53,10 +53,16 @@ function parseStrictNumber(value) {
   return Number.isFinite(n) ? n : null;
 }
 
-/** Maps live Firestore job records to canonical export rows (id -> legacy_firebase_id). */
+/**
+ * Maps live laser_jobs records to canonical export rows.
+ * legacy_firebase_id comes from the record's own legacy_firebase_id column
+ * (null/blank for normal Supabase-native rows, set only for rows carried
+ * over from the original Firestore migration) — never from the row's own
+ * primary key.
+ */
 export function buildExportRows(jobs) {
   return jobs.map((job) => ({
-    legacy_firebase_id: job.id ?? '',
+    legacy_firebase_id: job.legacy_firebase_id ?? '',
     tanggal: job.tanggal ?? '',
     operator: job.operator ?? '',
     invoice_code: job.invoice_code ?? '',

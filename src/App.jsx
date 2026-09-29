@@ -1,48 +1,37 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import {
   PlusCircle, History, Save, Trash2, Edit3, Download,
   Clock, User, Hash, Package, DollarSign, Lock, Unlock,
-  X, Check, Bell, Sun, Moon, UploadCloud
+  X, Check, Bell, Sun, Moon, UploadCloud, LogOut
 } from 'lucide-react';
 
-// --- FIREBASE IMPORTS ---
-import { initializeApp } from 'firebase/app';
-import { getFirestore, collection, onSnapshot, addDoc, doc, updateDoc, deleteDoc, writeBatch } from 'firebase/firestore';
+// --- SUPABASE AUTH + DATA ---
+import { getCurrentSession, signInWithPassword, signOut, onAuthStateChange, fetchProfile } from './lib/auth';
+import { fetchAllJobs, insertJob, updateJob, deleteJob, insertMigrationRows } from './lib/laserJobs';
 
 // --- CSV MIGRATION TRANSPORT (export/import validation, lossless round trip) ---
 import { exportJobsToCsv, parseImportCsv } from './lib/csvMigration';
 
-/**
- * --- KONFIGURASI FIREBASE MILIKMU ---
- * Cek override bawaan sistem dihapus total agar selalu terkoneksi 
- * 100% ke database cg-laser-tracker milikmu.
- */
-const firebaseConfig = {
-  apiKey: "AIzaSyDmATeZFwmwSPBoOvZAm4-YAVXZQ2fb9A4",
-  authDomain: "cg-laser-tracker.firebaseapp.com",
-  projectId: "cg-laser-tracker",
-  storageBucket: "cg-laser-tracker.firebasestorage.app",
-  messagingSenderId: "298068953473",
-  appId: "1:298068953473:web:f9e798be563c7030e34080",
-  measurementId: "G-QT3CC4CCY3"
-};
-
-// Inisialisasi Firebase
-const app = initializeApp(firebaseConfig);
-const db = getFirestore(app);
-
-const ADMIN_PASSWORD = "cg";
+function computeDefaultPrice(qty) {
+  if (qty >= 10 && qty <= 50) return 35000;
+  if (qty > 50) return 25000;
+  return 50000;
+}
 
 const App = () => {
   const [activeTab, setActiveTab] = useState('input');
   const [jobs, setJobs] = useState([]);
-  const [loading, setLoading] = useState(true);
+  const [jobsLoading, setJobsLoading] = useState(false);
 
-  // State Admin & Notifikasi
-  const [isAdmin, setIsAdmin] = useState(false);
-  const [showLoginModal, setShowLoginModal] = useState(false);
-  const [passInput, setPassInput] = useState("");
-  const [loginError, setLoginError] = useState("");
+  // --- Auth state ---
+  const [authLoading, setAuthLoading] = useState(true);
+  const [session, setSession] = useState(null);
+  const [profile, setProfile] = useState(null);
+  const [loginEmail, setLoginEmail] = useState('');
+  const [loginPassword, setLoginPassword] = useState('');
+  const [loginError, setLoginError] = useState('');
+  const [loginSubmitting, setLoginSubmitting] = useState(false);
+
   const [notification, setNotification] = useState({ show: false, message: '', type: 'info' });
   const [editingJob, setEditingJob] = useState(null);
   const [jobToDelete, setJobToDelete] = useState(null);
@@ -80,100 +69,154 @@ const App = () => {
     setTimeout(() => setNotification({ show: false, message: '', type: 'info' }), 3000);
   };
 
-  // Logika Harga
+  // --- SUPABASE: SESSION RESTORATION + AUTH STATE LISTENER ---
   useEffect(() => {
-    const qty = parseInt(formData.jumlah_unit) || 0;
-    let price = 50000;
-    if (qty >= 10 && qty <= 50) price = 35000;
-    else if (qty > 50) price = 25000;
-    setFormData(prev => ({ ...prev, harga_per_unit: price }));
-  }, [formData.jumlah_unit]);
+    let cancelled = false;
 
-  // --- FIREBASE: FETCH DATA REAL-TIME ---
-  useEffect(() => {
-    setLoading(true);
+    async function restore() {
+      try {
+        const current = await getCurrentSession();
+        if (!cancelled) setSession(current);
+      } finally {
+        if (!cancelled) setAuthLoading(false);
+      }
+    }
+    restore();
 
-    // Langsung akses koleksi laser_jobs tanpa proteksi tambahan
-    const unsubscribe = onSnapshot(collection(db, 'laser_jobs'), (snapshot) => {
-      const data = snapshot.docs.map(document => ({ id: document.id, ...document.data() }));
-      // Sortir data terbaru di atas
-      data.sort((a, b) => new Date(b.tanggal) - new Date(a.tanggal));
-      setJobs(data);
-      setLoading(false);
-    }, (error) => {
-      console.error("Error fetching data: ", error);
-      setLoading(false);
-      notify("Gagal mengambil data: " + error.message, 'error');
+    const unsubscribe = onAuthStateChange((nextSession) => {
+      setSession(nextSession);
+      if (!nextSession) {
+        setProfile(null);
+        setJobs([]);
+      }
     });
 
-    return () => unsubscribe();
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
   }, []);
 
-  const handleAdminLogin = (e) => {
+  // --- Load the authorized role from public.profiles once a session exists ---
+  useEffect(() => {
+    if (!session) return;
+    let cancelled = false;
+
+    async function loadProfile() {
+      try {
+        const data = await fetchProfile(session.user.id);
+        if (!cancelled) setProfile(data);
+        if (!cancelled && !data) {
+          notify('Profil pengguna tidak ditemukan — hubungi admin.', 'error');
+        }
+      } catch (err) {
+        if (!cancelled) notify('Gagal memuat profil: ' + err.message, 'error');
+      }
+    }
+    loadProfile();
+
+    return () => { cancelled = true; };
+  }, [session]);
+
+  const isAdmin = profile?.role === 'admin';
+
+  const loadJobs = useCallback(async () => {
+    setJobsLoading(true);
+    try {
+      const data = await fetchAllJobs();
+      setJobs(data);
+    } catch (err) {
+      notify('Gagal mengambil data: ' + err.message, 'error');
+    } finally {
+      setJobsLoading(false);
+    }
+  }, []);
+
+  // --- SUPABASE: FETCH DATA once authenticated ---
+  useEffect(() => {
+    if (!session) return;
+    loadJobs();
+  }, [session, loadJobs]);
+
+  const handleLogin = async (e) => {
     e.preventDefault();
-    if (passInput === ADMIN_PASSWORD) {
-      setIsAdmin(true);
-      setShowLoginModal(false);
-      setPassInput("");
-      setLoginError("");
-      notify("Berhasil masuk sebagai Admin", "success");
-    } else {
-      setLoginError("Password salah!");
+    setLoginSubmitting(true);
+    setLoginError('');
+    try {
+      await signInWithPassword(loginEmail, loginPassword);
+      setLoginEmail('');
+      setLoginPassword('');
+      notify('Berhasil masuk', 'success');
+    } catch {
+      setLoginError('Email atau password salah.');
+    } finally {
+      setLoginSubmitting(false);
     }
   };
 
-  // --- FIREBASE: SIMPAN DATA BARU ---
+  const handleLogout = async () => {
+    try {
+      await signOut();
+      notify('Berhasil keluar', 'success');
+    } catch (err) {
+      notify('Gagal keluar: ' + err.message, 'error');
+    }
+  };
+
+  const handleQtyChange = (value) => {
+    const qty = parseInt(value) || 0;
+    setFormData(prev => ({ ...prev, jumlah_unit: value, harga_per_unit: computeDefaultPrice(qty) }));
+  };
+
+  // --- SUPABASE: SIMPAN DATA BARU ---
   const handleSubmit = async (e) => {
     e.preventDefault();
-
-    const total = formData.jumlah_unit * formData.harga_per_unit;
-    const payload = { ...formData, total_penghasilan: total, created_at: new Date().toISOString() };
-
     try {
-      await addDoc(collection(db, 'laser_jobs'), payload);
-      notify('Job berhasil disimpan ke Cloud!', 'success');
-      setFormData({ ...formData, invoice_code: '', customer: '', deskripsi: '', jumlah_unit: 1 });
+      await insertJob(formData);
+      notify('Job berhasil disimpan!', 'success');
+      setFormData({ ...formData, invoice_code: '', customer: '', deskripsi: '', jumlah_unit: 1, harga_per_unit: 50000 });
+      await loadJobs();
     } catch (err) {
       notify('Gagal simpan: ' + err.message, 'error');
     }
   };
 
-  // --- FIREBASE: UPDATE DATA ---
+  // --- SUPABASE: UPDATE DATA ---
   const handleUpdateJob = async (e) => {
     e.preventDefault();
     if (!editingJob || !isAdmin) return;
 
-    const total = editingJob.jumlah_unit * editingJob.harga_per_unit;
-    const payload = { ...editingJob, total_penghasilan: total };
-    const jobId = payload.id;
-    delete payload.id;
-
     try {
-      await updateDoc(doc(db, 'laser_jobs', jobId), payload);
+      await updateJob(editingJob.id, editingJob);
       notify('Data berhasil diperbarui!', 'success');
       setEditingJob(null);
+      await loadJobs();
     } catch (err) {
       notify('Gagal update: ' + err.message, 'error');
     }
   };
 
-  // --- FIREBASE: HAPUS DATA ---
+  // --- SUPABASE: HAPUS DATA ---
   const confirmDelete = async () => {
     if (!isAdmin || !jobToDelete) return;
     try {
-      await deleteDoc(doc(db, 'laser_jobs', jobToDelete));
+      await deleteJob(jobToDelete);
       notify('Data dihapus', 'success');
       setJobToDelete(null);
+      await loadJobs();
     } catch (err) {
       notify('Gagal hapus: ' + err.message, 'error');
     }
   };
 
-  // --- FITUR MIGRASI: IMPORT CSV KE FIREBASE ---
-  // Pre-flight pipeline (parse -> validate headers -> validate every row -> check
-  // duplicates) happens entirely in parseImportCsv before any Firestore write.
+  // --- FITUR MIGRASI: IMPORT CSV KE SUPABASE ---
+  // Pre-flight pipeline (parse -> validate headers -> validate every row ->
+  // check duplicates) happens entirely in parseImportCsv before any write.
   // If any row is invalid or any duplicate legacy_firebase_id is detected, ZERO
-  // records are written.
+  // records are written. Each chunk sent to Supabase is one atomic INSERT
+  // statement; a file that fits in a single chunk is fully atomic. A file
+  // split across multiple chunks is NOT atomic end-to-end — see
+  // insertMigrationRows in src/lib/laserJobs.js.
   const handleCSVImport = (e) => {
     const file = e.target.files[0];
     if (!file) return;
@@ -199,21 +242,20 @@ const App = () => {
       }
 
       try {
-        // Firestore batched writes are capped at 500 ops; chunk to stay safely
-        // under that while keeping each chunk atomic (all-or-nothing).
-        const CHUNK_SIZE = 450;
-        for (let i = 0; i < result.rows.length; i += CHUNK_SIZE) {
-          const chunk = result.rows.slice(i, i + CHUNK_SIZE);
-          const batch = writeBatch(db);
-          chunk.forEach((row) => {
-            const ref = doc(collection(db, 'laser_jobs'));
-            batch.set(ref, row);
-          });
-          await batch.commit();
+        const summary = await insertMigrationRows(result.rows);
+        if (summary.failed > 0) {
+          console.error('Sebagian migrasi gagal ditulis:', summary.failedChunks);
+          notify(
+            `Imported: ${summary.inserted} | Gagal: ${summary.failed}` +
+              (summary.chunked ? ' (tidak sepenuhnya atomik — lihat console)' : ''),
+            'error'
+          );
+        } else {
+          notify(`Imported: ${summary.inserted} records | Rejected: 0`, 'success');
         }
-        notify(`Imported: ${result.rows.length} records | Rejected: 0`, 'success');
+        await loadJobs();
       } catch (err) {
-        console.error('Gagal menulis migrasi ke Firestore', err);
+        console.error('Gagal menulis migrasi ke Supabase', err);
         notify(`Gagal migrasi: ${err.message}`, 'error');
       }
     };
@@ -244,6 +286,47 @@ const App = () => {
     duration: jobs.reduce((acc, curr) => acc + ((parseInt(curr.jumlah_unit) || 0) * (parseInt(curr.durasi_menit) || 0)), 0)
   };
 
+  // --- Auth gate: restoring session ---
+  if (authLoading) {
+    return (
+      <div className="min-h-screen bg-slate-50 dark:bg-slate-950 flex items-center justify-center">
+        <p className="text-slate-400 dark:text-slate-500 text-sm italic font-medium tracking-widest">Memuat sesi...</p>
+      </div>
+    );
+  }
+
+  // --- Auth gate: no session, show login only. No dashboard/history is rendered. ---
+  if (!session) {
+    return (
+      <div className="min-h-screen bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 font-sans flex items-center justify-center p-4 transition-colors duration-300">
+        <div className="bg-white dark:bg-slate-900 rounded-[2.5rem] p-10 max-w-sm w-full shadow-2xl relative overflow-hidden transition-colors">
+          <div className="absolute top-0 left-0 w-full h-2 bg-yellow-400 dark:bg-yellow-500"></div>
+          <h1 className="text-2xl font-black text-slate-800 dark:text-white flex items-center gap-3 mb-2 mt-2">
+            <span className="bg-yellow-400 dark:bg-yellow-500 p-2.5 rounded-2xl text-white dark:text-slate-900 shadow-lg shadow-yellow-200 dark:shadow-none">⚡</span>
+            CG Digital Print
+          </h1>
+          <p className="text-xs text-slate-400 dark:text-slate-500 mb-8 font-medium leading-relaxed uppercase tracking-widest text-center">Masuk untuk melanjutkan</p>
+          <form onSubmit={handleLogin}>
+            <input
+              type="email" required autoFocus placeholder="Email"
+              value={loginEmail} onChange={(e) => { setLoginEmail(e.target.value); setLoginError(''); }}
+              className="w-full p-4 bg-slate-50 dark:bg-slate-950 rounded-2xl border-none outline-none focus:ring-2 focus:ring-yellow-400 transition-all mb-4 font-bold text-slate-800 dark:text-white"
+            />
+            <input
+              type="password" required placeholder="Password"
+              value={loginPassword} onChange={(e) => { setLoginPassword(e.target.value); setLoginError(''); }}
+              className="w-full p-5 bg-slate-50 dark:bg-slate-950 rounded-2xl border-none outline-none focus:ring-2 focus:ring-yellow-400 transition-all mb-4 text-center font-black text-lg tracking-widest text-slate-800 dark:text-white"
+            />
+            {loginError && <p className="text-red-500 text-[10px] font-bold text-center mb-4 uppercase tracking-wider">{loginError}</p>}
+            <button type="submit" disabled={loginSubmitting} className="w-full bg-slate-900 dark:bg-yellow-500 text-white dark:text-slate-900 font-black py-5 rounded-2xl shadow-xl dark:shadow-none transition-all active:scale-95 uppercase tracking-widest text-sm disabled:opacity-60">
+              {loginSubmitting ? 'Memproses...' : 'Masuk'}
+            </button>
+          </form>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 font-sans p-4 md:p-8 pb-20 transition-colors duration-300">
 
@@ -271,12 +354,17 @@ const App = () => {
             {isDark ? <Sun size={20} className="text-yellow-400" /> : <Moon size={20} />}
           </button>
 
-          <button
-            onClick={() => isAdmin ? setIsAdmin(false) : setShowLoginModal(true)}
-            className={`p-3 rounded-2xl flex items-center gap-2 font-bold transition-all shadow-sm border ${isAdmin ? 'bg-red-50 dark:bg-red-900/30 text-red-600 dark:text-red-400 border-red-100 dark:border-red-900/50' : 'bg-white dark:bg-slate-800 text-slate-400 dark:text-slate-300 border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-700'}`}
-          >
+          <div className={`p-3 rounded-2xl flex items-center gap-2 font-bold shadow-sm border ${isAdmin ? 'bg-red-50 dark:bg-red-900/30 text-red-600 dark:text-red-400 border-red-100 dark:border-red-900/50' : 'bg-white dark:bg-slate-800 text-slate-400 dark:text-slate-300 border-slate-200 dark:border-slate-700'}`}>
             {isAdmin ? <Unlock size={20} /> : <Lock size={20} />}
-            <span className="text-xs uppercase tracking-tighter font-black hidden sm:block">{isAdmin ? "Admin Active" : "Locked"}</span>
+            <span className="text-xs uppercase tracking-tighter font-black hidden sm:block">{isAdmin ? "Admin Active" : "Read Only"}</span>
+          </div>
+
+          <button
+            onClick={handleLogout}
+            title="Keluar"
+            className="p-3 rounded-2xl flex items-center gap-2 font-bold transition-all shadow-sm border bg-white dark:bg-slate-800 text-slate-400 dark:text-slate-300 border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-700"
+          >
+            <LogOut size={20} />
           </button>
 
           <div className="flex bg-white dark:bg-slate-800 p-1.5 rounded-2xl shadow-sm border border-slate-200 dark:border-slate-700 transition-colors">
@@ -359,7 +447,7 @@ const App = () => {
                 <div className="grid grid-cols-2 gap-6">
                   <div>
                     <label className="text-[10px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest mb-2 block">Volume (Pcs)</label>
-                    <input type="number" min="1" value={formData.jumlah_unit} onChange={e => setFormData({ ...formData, jumlah_unit: e.target.value })} className="w-full p-4 bg-slate-50 dark:bg-slate-950 rounded-2xl border-none outline-none focus:ring-2 focus:ring-yellow-400 transition-all font-bold text-slate-900 dark:text-slate-100" />
+                    <input type="number" min="1" value={formData.jumlah_unit} onChange={e => handleQtyChange(e.target.value)} className="w-full p-4 bg-slate-50 dark:bg-slate-950 rounded-2xl border-none outline-none focus:ring-2 focus:ring-yellow-400 transition-all font-bold text-slate-900 dark:text-slate-100" />
                   </div>
                   <div>
                     <label className="text-[10px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest mb-2 block">Durasi/Pcs (m)</label>
@@ -410,8 +498,8 @@ const App = () => {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 dark:divide-slate-800/50">
-                  {loading ? (
-                    <tr><td colSpan="5" className="p-16 text-center text-slate-400 dark:text-slate-500 text-sm italic font-medium tracking-widest">Menghubungkan ke server Firebase...</td></tr>
+                  {jobsLoading ? (
+                    <tr><td colSpan="5" className="p-16 text-center text-slate-400 dark:text-slate-500 text-sm italic font-medium tracking-widest">Menghubungkan ke server...</td></tr>
                   ) : jobs.length === 0 ? (
                     <tr><td colSpan="5" className="p-16 text-center text-slate-400 dark:text-slate-500 text-sm">Belum ada data produksi yang tersimpan.</td></tr>
                   ) : (
@@ -451,25 +539,6 @@ const App = () => {
           </div>
         )}
       </div>
-
-      {/* Modal Admin Password */}
-      {showLoginModal && (
-        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-[100] flex items-center justify-center p-4">
-          <div className="bg-white dark:bg-slate-900 rounded-[2.5rem] p-10 max-w-sm w-full shadow-2xl relative overflow-hidden transition-colors">
-            <div className="absolute top-0 left-0 w-full h-2 bg-yellow-400 dark:bg-yellow-500"></div>
-            <div className="flex justify-between items-center mb-8">
-              <h3 className="text-2xl font-black text-slate-800 dark:text-white tracking-tighter">Admin Akses</h3>
-              <button onClick={() => { setShowLoginModal(false); setLoginError(""); }} className="text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 transition-all"><X size={24} /></button>
-            </div>
-            <p className="text-xs text-slate-400 dark:text-slate-500 mb-8 font-medium leading-relaxed uppercase tracking-widest text-center">Password Khusus Owner</p>
-            <form onSubmit={handleAdminLogin}>
-              <input type="password" autoFocus value={passInput} onChange={(e) => { setPassInput(e.target.value); setLoginError(""); }} placeholder="******" className="w-full p-5 bg-slate-50 dark:bg-slate-950 rounded-2xl border-none outline-none focus:ring-2 focus:ring-yellow-400 transition-all mb-4 text-center font-black text-lg tracking-widest text-slate-800 dark:text-white" />
-              {loginError && <p className="text-red-500 text-[10px] font-bold text-center mb-4 uppercase tracking-wider">{loginError}</p>}
-              <button type="submit" className="w-full bg-slate-900 dark:bg-yellow-500 text-white dark:text-slate-900 font-black py-5 rounded-2xl shadow-xl dark:shadow-none transition-all active:scale-95 uppercase tracking-widest text-sm">Unlock System</button>
-            </form>
-          </div>
-        </div>
-      )}
 
       {/* Modal Edit Data */}
       {editingJob && (
@@ -528,7 +597,7 @@ const App = () => {
 
       {/* Footer */}
       <div className="max-w-6xl mx-auto mt-12 text-center text-slate-400 dark:text-slate-500 text-[9px] font-black uppercase tracking-[0.5em] opacity-50 pb-10 transition-colors">
-        CG Digital Print Karawang • Firebase Production System v2.0
+        CG Digital Print Karawang • Supabase Production System v3.0
       </div>
     </div>
   );
