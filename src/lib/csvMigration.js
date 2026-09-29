@@ -17,10 +17,31 @@ export const CANONICAL_HEADERS = [
   'created_at',
 ];
 
+// Header set for the older, pre-canonical Firebase Vercel export (Release
+// v1.6 era) — 9 business columns only, no legacy_firebase_id/created_at.
+export const LEGACY_HEADERS = [
+  'Tanggal', 'Operator', 'Invoice', 'Customer', 'Deskripsi',
+  'Unit', 'Harga/Unit', 'Durasi(m)', 'Total',
+];
+
+// One-time legacy migration must be a single atomic INSERT statement — no
+// chunking, no partial writes. A file over this size is rejected outright.
+export const LEGACY_IMPORT_MAX_ROWS = 500;
+
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const INT_RE = /^-?\d+$/;
 const NUMBER_RE = /^-?\d+(\.\d+)?$/;
 const TOTAL_TOLERANCE = 0.01;
+
+/** True only when every canonical column is present (order-independent). */
+export function isCanonicalFormat(fields) {
+  return CANONICAL_HEADERS.every((h) => fields.includes(h));
+}
+
+/** True only when every legacy column is present (order-independent). */
+export function isLegacyFormat(fields) {
+  return LEGACY_HEADERS.every((h) => fields.includes(h));
+}
 
 export function isValidDateString(value) {
   if (typeof value !== 'string' || !DATE_RE.test(value)) return false;
@@ -256,5 +277,141 @@ export function parseImportCsv(csvText, existingJobs = []) {
     duplicateErrors: [],
     message: `${validRows.length} row(s) validated`,
     rows: validRows,
+  };
+}
+
+/**
+ * Validates a single row of the legacy 9-column Firebase export format.
+ * Maps legacy column names to canonical field names. There is no source
+ * document ID and no source created_at in this format — those columns
+ * simply don't exist, so the caller must never fabricate them.
+ */
+export function validateLegacyRow(rawRow, rowNumber) {
+  const errors = [];
+  const get = (key) => (rawRow[key] ?? '').toString().trim();
+
+  const tanggal = get('Tanggal');
+  if (!isValidDateString(tanggal)) errors.push('Tanggal must be a valid YYYY-MM-DD date');
+
+  const operator = get('Operator');
+  if (!isNonEmptyString(operator)) errors.push('Operator is required');
+
+  const jumlah_unit = parseStrictInt(rawRow['Unit']);
+  if (jumlah_unit === null || jumlah_unit <= 0) errors.push('Unit must be a valid integer > 0');
+
+  const harga_per_unit = parseStrictNumber(rawRow['Harga/Unit']);
+  if (harga_per_unit === null || harga_per_unit < 0) errors.push('Harga/Unit must be a valid number >= 0');
+
+  const durasi_menit = parseStrictInt(rawRow['Durasi(m)']);
+  if (durasi_menit === null || durasi_menit < 0) errors.push('Durasi(m) must be a valid integer >= 0');
+
+  const total_penghasilan = parseStrictNumber(rawRow['Total']);
+  if (total_penghasilan === null) errors.push('Total must be a valid number');
+
+  if (jumlah_unit !== null && harga_per_unit !== null && total_penghasilan !== null) {
+    const expected = jumlah_unit * harga_per_unit;
+    if (Math.abs(expected - total_penghasilan) > TOTAL_TOLERANCE) {
+      errors.push(
+        `Total mismatch: stored=${total_penghasilan}, expected=${expected} (Unit * Harga/Unit)`
+      );
+    }
+  }
+
+  const invoice_code = get('Invoice');
+  const customer = get('Customer');
+  const deskripsi = get('Deskripsi');
+
+  return {
+    rowNumber,
+    valid: errors.length === 0,
+    errors,
+    data:
+      errors.length === 0
+        ? {
+            legacy_firebase_id: null,
+            tanggal,
+            operator,
+            invoice_code,
+            customer,
+            deskripsi,
+            jumlah_unit,
+            harga_per_unit,
+            durasi_menit,
+          }
+        : null,
+  };
+}
+
+/**
+ * Pre-flight pipeline for the legacy 9-column format. Unlike
+ * parseImportCsv, there is no legacy_firebase_id to dedupe against — two
+ * rows with identical business fields are two real jobs and are never
+ * silently collapsed. Caps at LEGACY_IMPORT_MAX_ROWS because the caller
+ * writes this in a single atomic INSERT with no chunking.
+ */
+export function parseLegacyImportCsv(csvText) {
+  const parsed = Papa.parse(csvText, {
+    header: true,
+    skipEmptyLines: true,
+    transformHeader: (h) => h.trim(),
+  });
+
+  if (parsed.errors && parsed.errors.length > 0) {
+    return {
+      ok: false,
+      stage: 'parse',
+      headerErrors: [],
+      rowErrors: [],
+      message: `CSV parse error: ${parsed.errors.map((e) => `${e.message} (row ${e.row})`).join('; ')}`,
+      rows: [],
+    };
+  }
+
+  const fields = parsed.meta.fields || [];
+  if (!isLegacyFormat(fields)) {
+    const missingHeaders = LEGACY_HEADERS.filter((h) => !fields.includes(h));
+    return {
+      ok: false,
+      stage: 'headers',
+      headerErrors: missingHeaders,
+      rowErrors: [],
+      message: `Not a recognized legacy CSV: missing column(s) ${missingHeaders.join(', ')}`,
+      rows: [],
+    };
+  }
+
+  if (parsed.data.length > LEGACY_IMPORT_MAX_ROWS) {
+    return {
+      ok: false,
+      stage: 'size',
+      headerErrors: [],
+      rowErrors: [],
+      message: `File has ${parsed.data.length} rows, exceeding the ${LEGACY_IMPORT_MAX_ROWS}-row single-atomic-insert limit. Split the file or use the canonical migration importer instead.`,
+      rows: [],
+    };
+  }
+
+  // +2: header occupies row 1, data starts at row 2
+  const validations = parsed.data.map((row, idx) => validateLegacyRow(row, idx + 2));
+  const rowErrors = validations.filter((v) => !v.valid);
+
+  if (rowErrors.length > 0) {
+    return {
+      ok: false,
+      stage: 'validation',
+      headerErrors: [],
+      rowErrors,
+      message: `${rowErrors.length} invalid row(s) found`,
+      rows: [],
+    };
+  }
+
+  return {
+    ok: true,
+    stage: 'ready',
+    headerErrors: [],
+    rowErrors: [],
+    message: `${validations.length} row(s) validated`,
+    rows: validations.map((v) => v.data),
   };
 }

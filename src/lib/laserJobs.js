@@ -126,6 +126,53 @@ export async function deleteJob(id) {
 }
 
 /**
+ * Maps one validated legacy-format row (from csvMigration.validateLegacyRow)
+ * to a Supabase insert payload. No legacy_firebase_id (the source format has
+ * no document ID to carry over — never fabricate one) and no created_at
+ * (the source format has no original timestamp; Postgres' own default
+ * applies, which is why this is disclosed to the caller as a real loss of
+ * historical accuracy, not silently absorbed).
+ */
+export function toLegacyImportPayload(validatedRow) {
+  return {
+    legacy_firebase_id: null,
+    tanggal: validatedRow.tanggal,
+    operator: validatedRow.operator,
+    invoice_code: validatedRow.invoice_code || null,
+    customer: validatedRow.customer || null,
+    deskripsi: validatedRow.deskripsi || null,
+    jumlah_unit: validatedRow.jumlah_unit,
+    harga_per_unit: validatedRow.harga_per_unit,
+    durasi_menit: validatedRow.durasi_menit,
+  };
+}
+
+/**
+ * One-time legacy CSV migration path. Writes ALL rows in a single atomic
+ * INSERT statement (caller/parseLegacyImportCsv already caps the file at
+ * LEGACY_IMPORT_MAX_ROWS so this never needs chunking). Re-checks the table
+ * is empty against the live database right before writing — not just the
+ * caller's in-memory state — so a second accidental run is blocked even if
+ * the UI hasn't refreshed.
+ */
+export async function insertLegacyMigrationRows(validatedRows) {
+  const { count, error: countError } = await supabase
+    .from(TABLE)
+    .select('*', { count: 'exact', head: true });
+  if (countError) throw countError;
+  if (count > 0) {
+    throw new Error(
+      `laser_jobs already has ${count} row(s). Legacy import requires an empty table and can only run once.`
+    );
+  }
+
+  const payloads = validatedRows.map(toLegacyImportPayload);
+  const { error } = await supabase.from(TABLE).insert(payloads);
+  if (error) throw error;
+  return { inserted: payloads.length };
+}
+
+/**
  * Writes pre-validated migration rows (already passed through
  * csvMigration.parseImportCsv, so headers/types/duplicates are already
  * clean). Chunks at MIGRATION_CHUNK_SIZE; each chunk is one atomic INSERT.

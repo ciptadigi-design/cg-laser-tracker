@@ -7,10 +7,10 @@ import {
 
 // --- SUPABASE AUTH + DATA ---
 import { getCurrentSession, signInWithPassword, signOut, onAuthStateChange, fetchProfile } from './lib/auth';
-import { fetchAllJobs, insertJob, updateJob, deleteJob, insertMigrationRows } from './lib/laserJobs';
+import { fetchAllJobs, insertJob, updateJob, deleteJob, insertMigrationRows, insertLegacyMigrationRows } from './lib/laserJobs';
 
 // --- CSV MIGRATION TRANSPORT (export/import validation, lossless round trip) ---
-import { exportJobsToCsv, parseImportCsv } from './lib/csvMigration';
+import { exportJobsToCsv, parseImportCsv, parseLegacyImportCsv } from './lib/csvMigration';
 
 function computeDefaultPrice(qty) {
   if (qty >= 10 && qty <= 50) return 35000;
@@ -263,6 +263,54 @@ const App = () => {
     e.target.value = null;
   };
 
+  // --- ONE-TIME LEGACY IMPORT: 9-column pre-canonical Firebase export ---
+  // No document ID and no original created_at exist in this format, so
+  // legacy_firebase_id stays NULL and created_at is left to Postgres' own
+  // default — that loss of historical accuracy is disclosed in the success
+  // message, never silently absorbed. Requires an empty laser_jobs table
+  // (enforced live in insertLegacyMigrationRows) and writes in a single
+  // atomic INSERT — parseLegacyImportCsv rejects files over the 500-row cap
+  // outright rather than chunking, so this import is always all-or-nothing.
+  const handleLegacyCSVImport = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = async (event) => {
+      const text = event.target.result;
+      const result = parseLegacyImportCsv(text);
+
+      if (!result.ok) {
+        console.error('Import CSV Legacy dibatalkan:', result);
+        if (result.stage === 'headers') {
+          notify(`Import legacy dibatalkan: format tidak dikenali (kolom hilang: ${result.headerErrors.join(', ')})`, 'error');
+        } else if (result.stage === 'size') {
+          notify(`Import legacy dibatalkan: ${result.message}`, 'error');
+        } else if (result.stage === 'validation') {
+          notify(`Import legacy dibatalkan: 0 data ditulis, ${result.rowErrors.length} baris tidak valid — lihat console`, 'error');
+        } else {
+          notify(`Import legacy dibatalkan: ${result.message}`, 'error');
+        }
+        e.target.value = null;
+        return;
+      }
+
+      try {
+        const summary = await insertLegacyMigrationRows(result.rows);
+        notify(
+          `Legacy imported: ${summary.inserted} records. Catatan: created_at asli tidak tersedia di format ini — diisi waktu import.`,
+          'success'
+        );
+        await loadJobs();
+      } catch (err) {
+        console.error('Gagal menulis import legacy ke Supabase', err);
+        notify(`Gagal import legacy: ${err.message}`, 'error');
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = null;
+  };
+
   // Canonical, lossless CSV transport: includes legacy_firebase_id + created_at
   // and uses RFC 4180 quoting (via csvMigration.exportJobsToCsv) so commas,
   // quotes and newlines inside customer/deskripsi survive the round trip.
@@ -479,6 +527,15 @@ const App = () => {
                   <label className="px-4 py-2.5 bg-blue-100 hover:bg-blue-200 dark:bg-blue-900/30 dark:hover:bg-blue-800/50 text-blue-700 dark:text-blue-400 rounded-xl text-xs font-black flex items-center gap-2 cursor-pointer transition-all">
                     <UploadCloud size={16} /> Import CSV Migrasi
                     <input type="file" accept=".csv" className="hidden" onChange={handleCSVImport} />
+                  </label>
+                )}
+                {isAdmin && jobs.length === 0 && (
+                  <label
+                    title="Satu kali saja — hanya tersedia saat tabel kosong"
+                    className="px-4 py-2.5 bg-orange-100 hover:bg-orange-200 dark:bg-orange-900/30 dark:hover:bg-orange-800/50 text-orange-700 dark:text-orange-400 rounded-xl text-xs font-black flex items-center gap-2 cursor-pointer transition-all"
+                  >
+                    <UploadCloud size={16} /> Import CSV Legacy (1x)
+                    <input type="file" accept=".csv" className="hidden" onChange={handleLegacyCSVImport} />
                   </label>
                 )}
                 <button onClick={exportCSV} className="px-6 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-black flex items-center gap-2 transition-all shadow-md dark:shadow-none">

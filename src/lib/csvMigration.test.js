@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { exportJobsToCsv, parseImportCsv, validateRow, CANONICAL_HEADERS } from './csvMigration';
+import {
+  exportJobsToCsv, parseImportCsv, validateRow, CANONICAL_HEADERS,
+  parseLegacyImportCsv, validateLegacyRow, LEGACY_HEADERS, LEGACY_IMPORT_MAX_ROWS,
+} from './csvMigration';
 
 const baseJob = {
   id: '11111111-1111-4111-8111-111111111111',
@@ -203,6 +206,98 @@ describe('parseImportCsv pre-flight gating', () => {
   it('accepts a clean CSV with no duplicates', () => {
     const csv = exportJobsToCsv([baseJob]);
     const result = parseImportCsv(csv, [{ legacy_firebase_id: 'some-other-id' }]);
+    expect(result.ok).toBe(true);
+    expect(result.rows).toHaveLength(1);
+  });
+});
+
+function legacyCsv(rows) {
+  const header = LEGACY_HEADERS.join(',');
+  const lines = rows.map((r) =>
+    LEGACY_HEADERS.map((h) => r[h] ?? '').join(',')
+  );
+  return [header, ...lines].join('\r\n');
+}
+
+const legacyRow = {
+  Tanggal: '2026-01-15',
+  Operator: 'Budi',
+  Invoice: 'INV/CG/001',
+  Customer: 'PT Maju',
+  Deskripsi: 'Grafir logo',
+  Unit: '12',
+  'Harga/Unit': '35000',
+  'Durasi(m)': '8',
+  Total: '420000',
+};
+
+describe('legacy 9-column CSV format', () => {
+  it('recognizes the legacy header set and maps all 9 business fields', () => {
+    const result = parseLegacyImportCsv(legacyCsv([legacyRow]));
+    expect(result.ok).toBe(true);
+    expect(result.rows).toHaveLength(1);
+    const row = result.rows[0];
+    expect(row.tanggal).toBe('2026-01-15');
+    expect(row.operator).toBe('Budi');
+    expect(row.invoice_code).toBe('INV/CG/001');
+    expect(row.customer).toBe('PT Maju');
+    expect(row.deskripsi).toBe('Grafir logo');
+    expect(row.jumlah_unit).toBe(12);
+    expect(row.harga_per_unit).toBe(35000);
+    expect(row.durasi_menit).toBe(8);
+  });
+
+  it('never fabricates legacy_firebase_id — always null', () => {
+    const result = parseLegacyImportCsv(legacyCsv([legacyRow]));
+    expect(result.rows[0].legacy_firebase_id).toBeNull();
+  });
+
+  it('never includes a created_at field — the source format has none', () => {
+    const result = parseLegacyImportCsv(legacyCsv([legacyRow]));
+    expect(result.rows[0]).not.toHaveProperty('created_at');
+  });
+
+  it('preserves the original tanggal exactly', () => {
+    const result = parseLegacyImportCsv(legacyCsv([{ ...legacyRow, Tanggal: '2025-12-31' }]));
+    expect(result.ok).toBe(true);
+    expect(result.rows[0].tanggal).toBe('2025-12-31');
+  });
+
+  it('rejects a financial mismatch instead of silently recalculating', () => {
+    const result = parseLegacyImportCsv(legacyCsv([{ ...legacyRow, Total: '999999' }]));
+    expect(result.ok).toBe(false);
+    expect(result.stage).toBe('validation');
+    expect(result.rowErrors[0].errors.some((e) => e.includes('mismatch'))).toBe(true);
+  });
+
+  it('does not silently remove duplicate business rows — both pass through', () => {
+    const result = parseLegacyImportCsv(legacyCsv([legacyRow, { ...legacyRow }]));
+    expect(result.ok).toBe(true);
+    expect(result.rows).toHaveLength(2);
+  });
+
+  it('rejects an unrecognized/incomplete header set', () => {
+    const result = parseLegacyImportCsv('Tanggal,Operator\n2026-01-15,Budi\n');
+    expect(result.ok).toBe(false);
+    expect(result.stage).toBe('headers');
+  });
+
+  it('rejects a file over the single-atomic-insert row cap', () => {
+    const rows = Array.from({ length: LEGACY_IMPORT_MAX_ROWS + 1 }, () => ({ ...legacyRow }));
+    const result = parseLegacyImportCsv(legacyCsv(rows));
+    expect(result.ok).toBe(false);
+    expect(result.stage).toBe('size');
+  });
+
+  it('validateLegacyRow rejects an invalid date the same way the canonical validator does', () => {
+    const { valid, errors } = validateLegacyRow({ ...legacyRow, Tanggal: '15/01/2026' }, 2);
+    expect(valid).toBe(false);
+    expect(errors.some((e) => e.includes('Tanggal'))).toBe(true);
+  });
+
+  it('canonical importer is unaffected by the legacy format existing', () => {
+    const csv = exportJobsToCsv([{ ...baseJob }]);
+    const result = parseImportCsv(csv);
     expect(result.ok).toBe(true);
     expect(result.rows).toHaveLength(1);
   });

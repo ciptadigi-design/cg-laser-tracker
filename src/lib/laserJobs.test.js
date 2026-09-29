@@ -4,7 +4,7 @@ import { describe, it, expect, vi } from 'vitest';
 // it so these payload-mapping tests never touch the network.
 vi.mock('./supabase', () => ({ supabase: {} }));
 
-const { toNewJobPayload, toUpdatePayload, toMigrationRowPayload } = await import('./laserJobs');
+const { toNewJobPayload, toUpdatePayload, toMigrationRowPayload, toLegacyImportPayload } = await import('./laserJobs');
 
 describe('toNewJobPayload', () => {
   const formData = {
@@ -86,5 +86,39 @@ describe('toMigrationRowPayload', () => {
     expect(payload.legacy_firebase_id).toBe('firebase-doc-abc123');
     expect(payload.created_at).toBe('2026-01-15T03:22:10.123Z');
     expect(payload.jumlah_unit).toBe(12);
+  });
+});
+
+describe('toLegacyImportPayload', () => {
+  const validatedRow = {
+    legacy_firebase_id: null,
+    tanggal: '2026-01-15',
+    operator: 'Budi',
+    invoice_code: 'INV/CG/001',
+    customer: 'PT Maju',
+    deskripsi: 'Grafir logo',
+    jumlah_unit: 12,
+    harga_per_unit: 35000,
+    durasi_menit: 8,
+  };
+
+  it('never includes total_penghasilan — it is a GENERATED column', () => {
+    const payload = toLegacyImportPayload(validatedRow);
+    expect(payload).not.toHaveProperty('total_penghasilan');
+  });
+
+  it('never includes created_at — the legacy format has no original timestamp', () => {
+    const payload = toLegacyImportPayload(validatedRow);
+    expect(payload).not.toHaveProperty('created_at');
+  });
+
+  it('always sets legacy_firebase_id to null — no source document ID exists', () => {
+    const payload = toLegacyImportPayload(validatedRow);
+    expect(payload.legacy_firebase_id).toBeNull();
+  });
+
+  it('preserves tanggal exactly', () => {
+    const payload = toLegacyImportPayload(validatedRow);
+    expect(payload.tanggal).toBe('2026-01-15');
   });
 });
