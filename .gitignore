@@ -12,6 +12,11 @@ dist
 dist-ssr
 *.local
 
+# Environment variables (Supabase URL/keys, etc.) — never commit real values
+.env
+.env.local
+.env.*.local
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
