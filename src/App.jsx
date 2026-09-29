@@ -7,7 +7,10 @@ import {
 
 // --- FIREBASE IMPORTS ---
 import { initializeApp } from 'firebase/app';
-import { getFirestore, collection, onSnapshot, addDoc, doc, updateDoc, deleteDoc } from 'firebase/firestore';
+import { getFirestore, collection, onSnapshot, addDoc, doc, updateDoc, deleteDoc, writeBatch } from 'firebase/firestore';
+
+// --- CSV MIGRATION TRANSPORT (export/import validation, lossless round trip) ---
+import { exportJobsToCsv, parseImportCsv } from './lib/csvMigration';
 
 /**
  * --- KONFIGURASI FIREBASE MILIKMU ---
@@ -167,6 +170,10 @@ const App = () => {
   };
 
   // --- FITUR MIGRASI: IMPORT CSV KE FIREBASE ---
+  // Pre-flight pipeline (parse -> validate headers -> validate every row -> check
+  // duplicates) happens entirely in parseImportCsv before any Firestore write.
+  // If any row is invalid or any duplicate legacy_firebase_id is detected, ZERO
+  // records are written.
   const handleCSVImport = (e) => {
     const file = e.target.files[0];
     if (!file) return;
@@ -174,61 +181,60 @@ const App = () => {
     const reader = new FileReader();
     reader.onload = async (event) => {
       const text = event.target.result;
-      const lines = text.split(/\r?\n/);
-      const delimiter = text.indexOf(';') > -1 ? ';' : ',';
+      const result = parseImportCsv(text, jobs);
 
-      let count = 0;
-      let lastError = '';
-
-      for (let i = 1; i < lines.length; i++) {
-        if (!lines[i].trim()) continue;
-
-        const values = lines[i].split(delimiter);
-
-        if (values.length >= 9) {
-          const payload = {
-            tanggal: values[0].trim(),
-            operator: values[1].trim(),
-            invoice_code: values[2].trim(),
-            customer: values[3].trim(),
-            deskripsi: values[4].trim(),
-            jumlah_unit: parseInt(values[5]) || 0,
-            harga_per_unit: parseInt(values[6]) || 0,
-            durasi_menit: parseInt(values[7]) || 0,
-            total_penghasilan: parseInt(values[8]) || 0,
-            created_at: new Date().toISOString()
-          };
-          try {
-            await addDoc(collection(db, 'laser_jobs'), payload);
-            count++;
-          } catch (err) {
-            console.error("Gagal import baris", i, err);
-            lastError = err.message;
-          }
+      if (!result.ok) {
+        console.error('Import CSV Migrasi dibatalkan:', result);
+        if (result.stage === 'headers') {
+          notify(`Import dibatalkan: kolom wajib hilang (${result.headerErrors.join(', ')})`, 'error');
+        } else if (result.stage === 'validation') {
+          notify(`Import dibatalkan: 0 data ditulis, ${result.rowErrors.length} baris tidak valid — lihat console`, 'error');
+        } else if (result.stage === 'duplicates') {
+          notify(`Import dibatalkan: ${result.duplicateErrors.length} duplikat legacy_firebase_id terdeteksi — lihat console`, 'error');
+        } else {
+          notify(`Import dibatalkan: ${result.message}`, 'error');
         }
+        e.target.value = null;
+        return;
       }
 
-      if (count > 0) {
-        notify(`${count} data berhasil dimigrasi!`, 'success');
-      } else {
-        notify(`Gagal migrasi: ${lastError || 'Format CSV tidak cocok'}`, 'error');
+      try {
+        // Firestore batched writes are capped at 500 ops; chunk to stay safely
+        // under that while keeping each chunk atomic (all-or-nothing).
+        const CHUNK_SIZE = 450;
+        for (let i = 0; i < result.rows.length; i += CHUNK_SIZE) {
+          const chunk = result.rows.slice(i, i + CHUNK_SIZE);
+          const batch = writeBatch(db);
+          chunk.forEach((row) => {
+            const ref = doc(collection(db, 'laser_jobs'));
+            batch.set(ref, row);
+          });
+          await batch.commit();
+        }
+        notify(`Imported: ${result.rows.length} records | Rejected: 0`, 'success');
+      } catch (err) {
+        console.error('Gagal menulis migrasi ke Firestore', err);
+        notify(`Gagal migrasi: ${err.message}`, 'error');
       }
     };
     reader.readAsText(file);
     e.target.value = null;
   };
 
+  // Canonical, lossless CSV transport: includes legacy_firebase_id + created_at
+  // and uses RFC 4180 quoting (via csvMigration.exportJobsToCsv) so commas,
+  // quotes and newlines inside customer/deskripsi survive the round trip.
   const exportCSV = () => {
-    const headers = ["Tanggal", "Operator", "Invoice", "Customer", "Deskripsi", "Unit", "Harga/Unit", "Durasi(m)", "Total"];
-    const rows = jobs.map(j => [j.tanggal, j.operator, j.invoice_code, j.customer, j.deskripsi, j.jumlah_unit, j.harga_per_unit, j.durasi_menit, j.total_penghasilan]);
-    let csvContent = "data:text/csv;charset=utf-8," + headers.join(",") + "\n" + rows.map(e => e.join(",")).join("\n");
-    const encodedUri = encodeURI(csvContent);
+    const csvContent = exportJobsToCsv(jobs);
+    const blob = new Blob(['﻿' + csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
-    link.setAttribute("href", encodedUri);
+    link.setAttribute("href", url);
     link.setAttribute("download", `Laporan_Laser_CG_${new Date().toLocaleDateString()}.csv`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+    URL.revokeObjectURL(url);
     notify('Data siap diunduh!', 'success');
   };
 
