@@ -612,19 +612,27 @@ const App = () => {
 
           {period.mode === 'custom' && (
             <div className="flex flex-col sm:flex-row items-start sm:items-center gap-3">
-              <div className="flex items-center gap-2">
-                <CalendarRange size={16} className="text-slate-400" />
-                <input
-                  type="date" value={period.startDate}
-                  onChange={(e) => setPeriod((prev) => ({ ...prev, startDate: e.target.value }))}
-                  className="p-2.5 bg-slate-50 dark:bg-slate-950 rounded-xl border-none outline-none focus:ring-2 focus:ring-yellow-400 font-bold text-sm text-slate-700 dark:text-slate-200 color-scheme-light dark:color-scheme-dark"
-                />
-                <span className="text-slate-400 text-xs font-bold">s/d</span>
-                <input
-                  type="date" value={period.endDate}
-                  onChange={(e) => setPeriod((prev) => ({ ...prev, endDate: e.target.value }))}
-                  className="p-2.5 bg-slate-50 dark:bg-slate-950 rounded-xl border-none outline-none focus:ring-2 focus:ring-yellow-400 font-bold text-sm text-slate-700 dark:text-slate-200 color-scheme-light dark:color-scheme-dark"
-                />
+              <div className="flex items-center gap-3">
+                <CalendarRange size={16} className="text-slate-400 shrink-0" />
+                <label className="flex flex-col gap-1">
+                  <span className="text-[10px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest">Dari</span>
+                  <input
+                    type="date" value={period.startDate}
+                    max={period.endDate || undefined}
+                    onChange={(e) => setPeriod((prev) => ({ ...prev, startDate: e.target.value }))}
+                    className="w-40 p-2.5 bg-slate-50 dark:bg-slate-950 rounded-xl border-none outline-none focus:ring-2 focus:ring-yellow-400 font-bold text-sm text-slate-700 dark:text-slate-200 cursor-pointer [color-scheme:light] dark:[color-scheme:dark]"
+                  />
+                </label>
+                <span className="text-slate-400 text-xs font-bold self-end pb-3">s/d</span>
+                <label className="flex flex-col gap-1">
+                  <span className="text-[10px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest">Sampai</span>
+                  <input
+                    type="date" value={period.endDate}
+                    min={period.startDate || undefined}
+                    onChange={(e) => setPeriod((prev) => ({ ...prev, endDate: e.target.value }))}
+                    className="w-40 p-2.5 bg-slate-50 dark:bg-slate-950 rounded-xl border-none outline-none focus:ring-2 focus:ring-yellow-400 font-bold text-sm text-slate-700 dark:text-slate-200 cursor-pointer [color-scheme:light] dark:[color-scheme:dark]"
+                  />
+                </label>
               </div>
               {customRangeError && (!period.startDate || !period.endDate ? null : (
                 <span className="text-red-500 text-[10px] font-bold uppercase tracking-wide">{customRangeError}</span>
